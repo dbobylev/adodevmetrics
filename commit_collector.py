@@ -41,6 +41,51 @@ def _is_text_file(path: str) -> bool:
     return ext not in BINARY_EXTENSIONS
 
 
+def _get_field(obj, *names):
+    if obj is None:
+        return None
+
+    if isinstance(obj, dict):
+        for name in names:
+            if name in obj and obj[name] is not None:
+                return obj[name]
+        return None
+
+    for name in names:
+        value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_change(change) -> dict | None:
+    # Azure DevOps Python SDK declares GitCommitChanges.changes as [object],
+    # so depending on deserialization we may get either SDK models or raw dicts.
+    item = _get_field(change, 'item')
+    path = (
+        _get_field(item, 'path')
+        or _get_field(change, 'source_server_item', 'sourceServerItem')
+        or _get_field(change, 'original_path', 'originalPath')
+    )
+    if not path:
+        return None
+
+    is_folder = _get_field(item, 'is_folder', 'isFolder')
+    if is_folder is None:
+        git_object_type = _get_field(
+            item, 'git_object_type', 'gitObjectType', 'object_type', 'objectType'
+        )
+        is_folder = str(git_object_type or '').lower() == 'tree'
+    if is_folder or not _is_text_file(path):
+        return None
+
+    return {
+        'path': path,
+        'change_type': str(_get_field(change, 'change_type', 'changeType') or '').lower(),
+        'original_path': _get_field(change, 'original_path', 'originalPath') or path,
+    }
+
+
 @with_retry()
 def _fetch_commits_page(git_client: GitClient, project: str, repo: str,
                         criteria: GitQueryCommitsCriteria, skip: int) -> list:
@@ -85,16 +130,17 @@ def _count_lines_from_changes(git_client: GitClient, project: str, repo: str,
     if not changes or not changes.changes:
         return 0, 0
 
-    file_changes = [
-        c for c in changes.changes
-        if c.item and c.item.path and not c.item.is_folder
-           and _is_text_file(c.item.path)
-    ]
+    file_changes = []
+    for change in changes.changes:
+        normalized = _normalize_change(change)
+        if normalized:
+            file_changes.append(normalized)
+
     if not file_changes:
         return 0, 0
 
     needs_parent = any(
-        str(c.change_type or '').lower() not in ('add',) for c in file_changes
+        c['change_type'] not in ('add',) for c in file_changes
     )
     parent_id = None
     if needs_parent:
@@ -107,17 +153,18 @@ def _count_lines_from_changes(git_client: GitClient, project: str, repo: str,
 
     total_added = total_deleted = 0
     for change in file_changes:
-        path = change.item.path
-        ct = str(change.change_type or '').lower()
+        path = change['path']
+        old_path = change['original_path']
+        ct = change['change_type']
         try:
             if 'add' in ct and 'delete' not in ct:
                 new_content = _fetch_item_content(git_client, project, repo, path, commit_id)
                 a, d = _diff_lines(None, new_content)
             elif 'delete' in ct and parent_id:
-                old_content = _fetch_item_content(git_client, project, repo, path, parent_id)
+                old_content = _fetch_item_content(git_client, project, repo, old_path, parent_id)
                 a, d = _diff_lines(old_content, None)
             elif parent_id:  # edit / rename
-                old_content = _fetch_item_content(git_client, project, repo, path, parent_id)
+                old_content = _fetch_item_content(git_client, project, repo, old_path, parent_id)
                 new_content = _fetch_item_content(git_client, project, repo, path, commit_id)
                 a, d = _diff_lines(old_content, new_content)
             else:
