@@ -21,6 +21,14 @@ class PRStats:
     commented: int = 0
 
 
+@dataclass
+class PRRecord:
+    author_name: str
+    author_email: str
+    pr_id: int
+    date: datetime | None
+
+
 @with_retry()
 def _fetch_prs_page(git_client: GitClient, project: str, repo: str,
                     criteria: GitPullRequestSearchCriteria, skip: int) -> list:
@@ -34,7 +42,7 @@ def _fetch_pr_threads(git_client: GitClient, project: str, repo: str, pr_id: int
     return git_client.get_threads(repo, pr_id, project=project) or []
 
 
-def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
+def get_pr_stats(git_client: GitClient, config: Config) -> tuple[dict[str, PRStats], list[PRRecord]]:
     date_from = datetime.now(timezone.utc) - relativedelta(months=config.months_back)
 
     criteria = GitPullRequestSearchCriteria(status="all", repository_id=None)
@@ -44,6 +52,7 @@ def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
     print(f"  Период: {date_from.strftime('%d.%m.%Y')} — {date_to.strftime('%d.%m.%Y')}")
 
     stats: dict[str, PRStats] = {}
+    pr_list: list[PRRecord] = []
     skip = 0
     total = 0
     page_num = 0
@@ -74,7 +83,14 @@ def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
         for i, pr in enumerate(relevant, 1):
             pr_id = pr.pull_request_id
             title = (pr.title or "")[:50]
+            creator_name = (pr.created_by.display_name if pr.created_by else "")
             creator_email = (pr.created_by.unique_name if pr.created_by else "").lower()
+            pr_list.append(PRRecord(
+                author_name=creator_name,
+                author_email=creator_email,
+                pr_id=pr_id,
+                date=pr.creation_date,
+            ))
             if creator_email:
                 stats.setdefault(creator_email, PRStats())
                 stats[creator_email].created += 1
@@ -127,4 +143,4 @@ def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
     total_commented = sum(s.commented for s in stats.values())
     print(f"\nИтого PR: {total}")
     print(f"  Создано записей: {total_created} | Апрувов: {total_approved} | Комментариев: {total_commented}")
-    return stats
+    return stats, pr_list

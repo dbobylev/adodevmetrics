@@ -1,11 +1,10 @@
-from collections import defaultdict
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 from commit_collector import CommitInfo
-from pr_collector import PRStats
+from pr_collector import PRRecord
 
 HEADER_FILL = PatternFill("solid", fgColor="4472C4")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
@@ -30,7 +29,7 @@ def _autofit(ws):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 60)
 
 
-def export(commits: list[CommitInfo], pr_stats: dict[str, PRStats], repo_name: str) -> str:
+def export(commits: list[CommitInfo], pr_list: list[PRRecord], repo_name: str) -> str:
     wb = Workbook()
 
     # --- Лист 1: Commits ---
@@ -53,47 +52,19 @@ def export(commits: list[CommitInfo], pr_stats: dict[str, PRStats], repo_name: s
 
     _autofit(ws_commits)
 
-    # --- Лист 2: Summary ---
-    ws_summary = wb.create_sheet("Summary")
-    _apply_header(ws_summary, [
-        "Author", "Email", "Commits",
-        "Lines Added", "Lines Deleted",
-        "PRs Created", "PRs Approved", "PRs Commented",
-    ])
+    # --- Лист 2: PRs ---
+    ws_prs = wb.create_sheet("PRs")
+    _apply_header(ws_prs, ["Author", "Email", "PR ID", "Date"])
 
-    # Агрегация по email
-    author_names: dict[str, str] = {}
-    commits_count: dict[str, int] = defaultdict(int)
-    lines_added: dict[str, int] = defaultdict(int)
-    lines_deleted: dict[str, int] = defaultdict(int)
-
-    for c in commits:
-        email = c.author_email
-        author_names[email] = c.author_name
-        commits_count[email] += 1
-        lines_added[email] += c.lines_added
-        lines_deleted[email] += c.lines_deleted
-
-    all_emails = sorted(
-        set(list(commits_count.keys()) + list(pr_stats.keys())),
-        key=lambda e: commits_count.get(e, 0),
-        reverse=True,
-    )
-
-    for email in all_emails:
-        pr = pr_stats.get(email, PRStats())
-        ws_summary.append([
-            author_names.get(email, ""),
-            email,
-            commits_count.get(email, 0),
-            lines_added.get(email, 0),
-            lines_deleted.get(email, 0),
-            pr.created,
-            pr.approved,
-            pr.commented,
+    for pr in pr_list:
+        ws_prs.append([
+            pr.author_name,
+            pr.author_email,
+            pr.pr_id,
+            pr.date.strftime("%Y-%m-%d %H:%M") if pr.date else "",
         ])
 
-    _autofit(ws_summary)
+    _autofit(ws_prs)
 
     filename = f"{repo_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     wb.save(filename)

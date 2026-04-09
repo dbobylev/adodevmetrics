@@ -25,10 +25,10 @@ def main():
 
     commits = get_commits(git_client, config)
     print()
-    pr_stats = get_pr_stats(git_client, config)
+    pr_stats, pr_list = get_pr_stats(git_client, config)
     print()
 
-    filename = export(commits, pr_stats, config.repository)
+    filename = export(commits, pr_list, config.repository)
     print(f"Отчёт сохранён: {filename}")
 
 
