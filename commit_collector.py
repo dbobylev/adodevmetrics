@@ -86,6 +86,23 @@ def _normalize_change(change) -> dict | None:
     }
 
 
+def _same_author_and_committer(raw_commit) -> bool:
+    author = _get_field(raw_commit, 'author')
+    committer = _get_field(raw_commit, 'committer')
+
+    author_email = str(_get_field(author, 'email') or '').strip().lower()
+    committer_email = str(_get_field(committer, 'email') or '').strip().lower()
+    if author_email and committer_email:
+        return author_email == committer_email
+
+    author_name = str(_get_field(author, 'name') or '').strip().lower()
+    committer_name = str(_get_field(committer, 'name') or '').strip().lower()
+    if author_name and committer_name:
+        return author_name == committer_name
+
+    return False
+
+
 @with_retry()
 def _fetch_commits_page(git_client: GitClient, project: str, repo: str,
                         criteria: GitQueryCommitsCriteria, skip: int) -> list:
@@ -200,7 +217,10 @@ def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
             # parents не возвращается list-эндпоинтом ADO, поэтому определяем
             # merge-коммит по стандартному префиксу сообщения Azure DevOps
             comment = raw.comment or ""
-            if comment.startswith("Merged PR") or comment.startswith("Merge branch") or comment.startswith("Merge pull request"):
+            if comment.startswith("Merged PR") or comment.startswith("Merge remote-tracking branch") or comment.startswith("Merge branch") or comment.startswith("Merge pull request"):
+                continue
+
+            if not _same_author_and_committer(raw):
                 continue
 
             author = raw.author
