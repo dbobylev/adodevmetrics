@@ -66,6 +66,12 @@ def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
             break
 
         for raw in page:
+            # parents не возвращается list-эндпоинтом ADO, поэтому определяем
+            # merge-коммит по стандартному префиксу сообщения Azure DevOps
+            comment = raw.comment or ""
+            if comment.startswith("Merged PR") or comment.startswith("Merge branch") or comment.startswith("Merge pull request"):
+                continue
+
             author = raw.author
             info = CommitInfo(
                 commit_id=raw.commit_id,
