@@ -197,6 +197,7 @@ def _count_lines_from_changes(git_client: GitClient, project: str, repo: str,
 
 def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
     date_from = datetime.now(timezone.utc) - relativedelta(months=config.months_back)
+    date_to = datetime.now(timezone.utc)
 
     version = GitVersionDescriptor(version=config.branch, version_type="branch")
     criteria = GitQueryCommitsCriteria(
@@ -204,26 +205,42 @@ def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
         item_version=version,
     )
 
-    print(f"Сбор коммитов из ветки '{config.branch}' за последние {config.months_back} мес...")
+    print(f"Сбор коммитов из ветки '{config.branch}'")
+    print(f"  Период: {date_from.strftime('%d.%m.%Y')} — {date_to.strftime('%d.%m.%Y')}")
 
     all_commits: list[CommitInfo] = []
     skip = 0
     cache_hits = 0
+    filtered_merge = 0
+    filtered_author = 0
+    page_num = 0
 
     with CommitCache() as cache:
         while True:
+            page_num += 1
+            print(f"  [стр. {page_num}] Загрузка коммитов (skip={skip})...", end=" ", flush=True)
             page = _fetch_commits_page(git_client, config.project, config.repository, criteria, skip)
             if not page:
+                print("пусто")
                 break
+            print(f"получено {len(page)}")
+
+            page_accepted = 0
+            page_filtered_merge = 0
+            page_filtered_author = 0
 
             for raw in page:
                 # parents не возвращается list-эндпоинтом ADO, поэтому определяем
                 # merge-коммит по стандартному префиксу сообщения Azure DevOps
                 comment = raw.comment or ""
                 if comment.startswith("Merged PR") or comment.startswith("Merge remote-tracking branch") or comment.startswith("Merge branch") or comment.startswith("Merge pull request"):
+                    filtered_merge += 1
+                    page_filtered_merge += 1
                     continue
 
                 if not _same_author_and_committer(raw):
+                    filtered_author += 1
+                    page_filtered_author += 1
                     continue
 
                 author = raw.author
@@ -240,23 +257,41 @@ def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
                     info.lines_added, info.lines_deleted = cached
                     cache_hits += 1
                 else:
+                    short_id = raw.commit_id[:8]
+                    author_name = author.name if author else "?"
+                    print(f"    [{short_id}] {author_name} — загрузка изменений...", end=" ", flush=True)
                     try:
                         changes = _fetch_commit_changes(git_client, config.project, config.repository, raw.commit_id)
+                        file_count = len([c for c in (changes.changes or []) if _normalize_change(c)]) if changes else 0
+                        if file_count:
+                            print(f"{file_count} файлов", end=" ", flush=True)
                         info.lines_added, info.lines_deleted = _count_lines_from_changes(
                             git_client, config.project, config.repository, raw.commit_id, changes
                         )
+                        print(f"(+{info.lines_added} / -{info.lines_deleted})")
                     except Exception:
-                        pass
+                        print("ошибка")
                     cache.put(config.repository, raw.commit_id, info.lines_added, info.lines_deleted)
 
                 all_commits.append(info)
+                page_accepted += 1
+
+            filters_msg = ""
+            if page_filtered_merge or page_filtered_author:
+                parts = []
+                if page_filtered_merge:
+                    parts.append(f"merge: {page_filtered_merge}")
+                if page_filtered_author:
+                    parts.append(f"автор≠коммитер: {page_filtered_author}")
+                filters_msg = f", отфильтровано [{', '.join(parts)}]"
+            print(f"  [стр. {page_num}] Принято: {page_accepted}{filters_msg} | всего накоплено: {len(all_commits)} (кэш: {cache_hits})")
 
             skip += len(page)
-            if len(all_commits) % 100 == 0 or len(page) < PAGE_SIZE:
-                print(f"  Обработано коммитов: {len(all_commits)} (из кэша: {cache_hits})")
-
             if len(page) < PAGE_SIZE:
                 break
 
-    print(f"Итого коммитов: {len(all_commits)} (из кэша: {cache_hits})")
+    print(f"\nИтого коммитов: {len(all_commits)}")
+    print(f"  Из кэша: {cache_hits} | загружено через API: {len(all_commits) - cache_hits}")
+    if filtered_merge or filtered_author:
+        print(f"  Отфильтровано: merge={filtered_merge}, автор≠коммитер={filtered_author}")
     return all_commits

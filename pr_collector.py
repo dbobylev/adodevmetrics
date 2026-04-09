@@ -39,16 +39,23 @@ def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
 
     criteria = GitPullRequestSearchCriteria(status="all", repository_id=None)
 
-    print(f"Сбор данных по PR за последние {config.months_back} мес...")
+    date_to = datetime.now(timezone.utc)
+    print(f"Сбор данных по PR за последние {config.months_back} мес.")
+    print(f"  Период: {date_from.strftime('%d.%m.%Y')} — {date_to.strftime('%d.%m.%Y')}")
 
     stats: dict[str, PRStats] = {}
     skip = 0
     total = 0
+    page_num = 0
 
     while True:
+        page_num += 1
+        print(f"  [стр. {page_num}] Загрузка PR (skip={skip})...", end=" ", flush=True)
         page = _fetch_prs_page(git_client, config.project, config.repository, criteria, skip)
         if not page:
+            print("пусто")
             break
+        print(f"получено {len(page)}")
 
         relevant = []
         stop = False
@@ -59,7 +66,14 @@ def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
                 break
             relevant.append(pr)
 
-        for pr in relevant:
+        if stop and not relevant:
+            print(f"  [стр. {page_num}] Все PR старше периода, останавливаемся")
+        elif stop:
+            print(f"  [стр. {page_num}] Часть PR за пределами периода, берём {len(relevant)} из {len(page)}")
+
+        for i, pr in enumerate(relevant, 1):
+            pr_id = pr.pull_request_id
+            title = (pr.title or "")[:50]
             creator_email = (pr.created_by.unique_name if pr.created_by else "").lower()
             if creator_email:
                 stats.setdefault(creator_email, PRStats())
@@ -76,9 +90,11 @@ def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
                     stats[email].approved += 1
 
             # комментарии из threads
+            print(f"    PR #{pr_id} «{title}» — загрузка комментариев...", end=" ", flush=True)
             try:
-                threads = _fetch_pr_threads(git_client, config.project, config.repository, pr.pull_request_id)
+                threads = _fetch_pr_threads(git_client, config.project, config.repository, pr_id)
                 commenters = set()
+                thread_count = 0
                 for thread in threads:
                     if thread.is_deleted:
                         continue
@@ -91,20 +107,24 @@ def get_pr_stats(git_client: GitClient, config: Config) -> dict[str, PRStats]:
                         email = (author.unique_name or "").lower()
                         if email and email != creator_email:
                             commenters.add(email)
+                            thread_count += 1
                 for email in commenters:
                     stats.setdefault(email, PRStats())
                     stats[email].commented += 1
+                print(f"тредов: {len(threads)}, комментаторов: {len(commenters)}")
             except Exception:
-                pass
+                print("ошибка")
 
         total += len(relevant)
         skip += len(page)
-
-        if total % 50 == 0 or len(page) < PAGE_SIZE or stop:
-            print(f"  Обработано PR: {total}")
+        print(f"  [стр. {page_num}] Принято PR: {len(relevant)} | всего накоплено: {total}")
 
         if len(page) < PAGE_SIZE or stop:
             break
 
-    print(f"Итого PR: {total}")
+    total_created = sum(s.created for s in stats.values())
+    total_approved = sum(s.approved for s in stats.values())
+    total_commented = sum(s.commented for s in stats.values())
+    print(f"\nИтого PR: {total}")
+    print(f"  Создано записей: {total_created} | Апрувов: {total_approved} | Комментариев: {total_commented}")
     return stats
