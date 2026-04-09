@@ -1,3 +1,5 @@
+import difflib
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
@@ -9,6 +11,19 @@ from ado_client import with_retry
 
 PAGE_SIZE = 100
 
+# Binary file extensions — skipped when counting line diffs.
+# Oracle PL/SQL extensions (.bdy, .spc, .trg, .prc, .fun, .typ, .tps, .tpb,
+# .vw, .seq, .syn, .idx, .sql, .pls, .plb) are text and NOT listed here.
+BINARY_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.webp',
+    '.pdf', '.zip', '.tar', '.gz', '.7z', '.rar',
+    '.exe', '.dll', '.so', '.dylib', '.obj', '.class',
+    '.pyc', '.pdb', '.bin', '.dat',
+    '.ttf', '.otf', '.woff', '.woff2',
+    '.mp3', '.mp4', '.avi', '.mov',
+    '.xlsx', '.docx', '.pptx',
+}
+
 
 @dataclass
 class CommitInfo:
@@ -19,6 +34,11 @@ class CommitInfo:
     message: str
     lines_added: int = 0
     lines_deleted: int = 0
+
+
+def _is_text_file(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    return ext not in BINARY_EXTENSIONS
 
 
 @with_retry()
@@ -34,16 +54,80 @@ def _fetch_commit_changes(git_client: GitClient, project: str, repo: str, commit
     return git_client.get_changes(commit_id, repo, project=project)
 
 
-def _count_lines(changes) -> tuple[int, int]:
-    added = 0
-    deleted = 0
-    if not changes or not changes.changes:
-        return added, deleted
-    for change in changes.changes:
-        if change.change_counts:
-            added += change.change_counts.get("Add", 0) + change.change_counts.get("Edit", 0)
-            deleted += change.change_counts.get("Delete", 0) + change.change_counts.get("Edit", 0)
+@with_retry()
+def _fetch_single_commit(git_client: GitClient, project: str, repo: str, commit_id: str):
+    return git_client.get_commit(commit_id, repo, project=project)
+
+
+@with_retry()
+def _fetch_item_content(git_client: GitClient, project: str, repo: str,
+                        path: str, commit_id: str) -> str | None:
+    vd = GitVersionDescriptor(version=commit_id, version_type="commit")
+    item = git_client.get_item(repo, path, project=project,
+                               include_content=True, version_descriptor=vd)
+    return item.content if item else None
+
+
+def _diff_lines(old: str | None, new: str | None) -> tuple[int, int]:
+    old_lines = old.splitlines() if old else []
+    new_lines = new.splitlines() if new else []
+    added = deleted = 0
+    for line in difflib.unified_diff(old_lines, new_lines, n=0, lineterm=''):
+        if line.startswith('+') and not line.startswith('+++'):
+            added += 1
+        elif line.startswith('-') and not line.startswith('---'):
+            deleted += 1
     return added, deleted
+
+
+def _count_lines_from_changes(git_client: GitClient, project: str, repo: str,
+                               commit_id: str, changes) -> tuple[int, int]:
+    if not changes or not changes.changes:
+        return 0, 0
+
+    file_changes = [
+        c for c in changes.changes
+        if c.item and c.item.path and not c.item.is_folder
+           and _is_text_file(c.item.path)
+    ]
+    if not file_changes:
+        return 0, 0
+
+    needs_parent = any(
+        str(c.change_type or '').lower() not in ('add',) for c in file_changes
+    )
+    parent_id = None
+    if needs_parent:
+        try:
+            single = _fetch_single_commit(git_client, project, repo, commit_id)
+            if single.parents:
+                parent_id = single.parents[0]
+        except Exception:
+            pass
+
+    total_added = total_deleted = 0
+    for change in file_changes:
+        path = change.item.path
+        ct = str(change.change_type or '').lower()
+        try:
+            if 'add' in ct and 'delete' not in ct:
+                new_content = _fetch_item_content(git_client, project, repo, path, commit_id)
+                a, d = _diff_lines(None, new_content)
+            elif 'delete' in ct and parent_id:
+                old_content = _fetch_item_content(git_client, project, repo, path, parent_id)
+                a, d = _diff_lines(old_content, None)
+            elif parent_id:  # edit / rename
+                old_content = _fetch_item_content(git_client, project, repo, path, parent_id)
+                new_content = _fetch_item_content(git_client, project, repo, path, commit_id)
+                a, d = _diff_lines(old_content, new_content)
+            else:
+                continue
+            total_added += a
+            total_deleted += d
+        except Exception:
+            pass  # best-effort: skip individual file on error
+
+    return total_added, total_deleted
 
 
 def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
@@ -83,7 +167,9 @@ def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
 
             try:
                 changes = _fetch_commit_changes(git_client, config.project, config.repository, raw.commit_id)
-                info.lines_added, info.lines_deleted = _count_lines(changes)
+                info.lines_added, info.lines_deleted = _count_lines_from_changes(
+                    git_client, config.project, config.repository, raw.commit_id, changes
+                )
             except Exception:
                 pass
 
