@@ -8,6 +8,7 @@ from azure.devops.v7_1.git.models import GitQueryCommitsCriteria, GitVersionDesc
 
 from config import Config
 from ado_client import with_retry
+from commit_cache import CommitCache
 
 PAGE_SIZE = 100
 
@@ -207,47 +208,55 @@ def get_commits(git_client: GitClient, config: Config) -> list[CommitInfo]:
 
     all_commits: list[CommitInfo] = []
     skip = 0
+    cache_hits = 0
 
-    while True:
-        page = _fetch_commits_page(git_client, config.project, config.repository, criteria, skip)
-        if not page:
-            break
+    with CommitCache() as cache:
+        while True:
+            page = _fetch_commits_page(git_client, config.project, config.repository, criteria, skip)
+            if not page:
+                break
 
-        for raw in page:
-            # parents не возвращается list-эндпоинтом ADO, поэтому определяем
-            # merge-коммит по стандартному префиксу сообщения Azure DevOps
-            comment = raw.comment or ""
-            if comment.startswith("Merged PR") or comment.startswith("Merge remote-tracking branch") or comment.startswith("Merge branch") or comment.startswith("Merge pull request"):
-                continue
+            for raw in page:
+                # parents не возвращается list-эндпоинтом ADO, поэтому определяем
+                # merge-коммит по стандартному префиксу сообщения Azure DevOps
+                comment = raw.comment or ""
+                if comment.startswith("Merged PR") or comment.startswith("Merge remote-tracking branch") or comment.startswith("Merge branch") or comment.startswith("Merge pull request"):
+                    continue
 
-            if not _same_author_and_committer(raw):
-                continue
+                if not _same_author_and_committer(raw):
+                    continue
 
-            author = raw.author
-            info = CommitInfo(
-                commit_id=raw.commit_id,
-                author_name=author.name if author else "",
-                author_email=(author.email if author else "").lower(),
-                date=author.date if author else datetime.now(timezone.utc),
-                message=(raw.comment or "").splitlines()[0],
-            )
-
-            try:
-                changes = _fetch_commit_changes(git_client, config.project, config.repository, raw.commit_id)
-                info.lines_added, info.lines_deleted = _count_lines_from_changes(
-                    git_client, config.project, config.repository, raw.commit_id, changes
+                author = raw.author
+                info = CommitInfo(
+                    commit_id=raw.commit_id,
+                    author_name=author.name if author else "",
+                    author_email=(author.email if author else "").lower(),
+                    date=author.date if author else datetime.now(timezone.utc),
+                    message=(raw.comment or "").splitlines()[0],
                 )
-            except Exception:
-                pass
 
-            all_commits.append(info)
+                cached = cache.get(config.repository, raw.commit_id)
+                if cached is not None:
+                    info.lines_added, info.lines_deleted = cached
+                    cache_hits += 1
+                else:
+                    try:
+                        changes = _fetch_commit_changes(git_client, config.project, config.repository, raw.commit_id)
+                        info.lines_added, info.lines_deleted = _count_lines_from_changes(
+                            git_client, config.project, config.repository, raw.commit_id, changes
+                        )
+                    except Exception:
+                        pass
+                    cache.put(config.repository, raw.commit_id, info.lines_added, info.lines_deleted)
 
-        skip += len(page)
-        if len(all_commits) % 100 == 0 or len(page) < PAGE_SIZE:
-            print(f"  Обработано коммитов: {len(all_commits)}")
+                all_commits.append(info)
 
-        if len(page) < PAGE_SIZE:
-            break
+            skip += len(page)
+            if len(all_commits) % 100 == 0 or len(page) < PAGE_SIZE:
+                print(f"  Обработано коммитов: {len(all_commits)} (из кэша: {cache_hits})")
 
-    print(f"Итого коммитов: {len(all_commits)}")
+            if len(page) < PAGE_SIZE:
+                break
+
+    print(f"Итого коммитов: {len(all_commits)} (из кэша: {cache_hits})")
     return all_commits
