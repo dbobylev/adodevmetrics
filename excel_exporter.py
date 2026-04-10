@@ -1,7 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+
+DATE_FORMAT = "DD.MM.YYYY HH:MM"
 
 from commit_collector import CommitInfo
 from pr_collector import PRRecord
@@ -18,6 +20,22 @@ def _apply_header(ws, headers: list[str]):
         cell.font = HEADER_FONT
         cell.alignment = HEADER_ALIGN
     ws.freeze_panes = "A2"
+
+
+def _naive(dt: datetime | None) -> datetime | None:
+    """Strip timezone info so openpyxl can write the datetime as an Excel date."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _fmt_date_col(ws, col: int):
+    """Apply DATE_FORMAT to all data cells in the given 1-based column."""
+    for row in ws.iter_rows(min_row=2, min_col=col, max_col=col):
+        for cell in row:
+            cell.number_format = DATE_FORMAT
 
 
 def _autofit(ws):
@@ -43,13 +61,14 @@ def export(commits: list[CommitInfo], pr_list: list[PRRecord], repo_name: str) -
         ws_commits.append([
             c.author_name,
             c.author_email,
-            c.date.strftime("%Y-%m-%d %H:%M") if c.date else "",
+            _naive(c.date),
             c.commit_id[:8],
             c.message,
             c.lines_added,
             c.lines_deleted,
         ])
 
+    _fmt_date_col(ws_commits, col=3)
     _autofit(ws_commits)
 
     # --- Лист 2: PRs ---
@@ -61,9 +80,10 @@ def export(commits: list[CommitInfo], pr_list: list[PRRecord], repo_name: str) -
             pr.author_name,
             pr.author_email,
             pr.pr_id,
-            pr.date.strftime("%Y-%m-%d %H:%M") if pr.date else "",
+            _naive(pr.date),
         ])
 
+    _fmt_date_col(ws_prs, col=4)
     _autofit(ws_prs)
 
     filename = f"{repo_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
